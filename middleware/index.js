@@ -32,21 +32,30 @@ app.post('/inbound', async (req, res) => {
         // Ensure E.164 format (Add '+' if missing)
         const formatE164 = (num) => (num && !num.startsWith('+') ? `+${num}` : num);
 
-        // Construct 3CX Expected Payload
+        // Construct 3CX Expected Payload (Generic SMS Provider format)
         const threeCxPayload = {
             "data": {
                 "id": messageId,
                 "event_type": "message.received",
+                "occurred_at": new Date().toISOString(),
                 "payload": {
+                    "direction": "inbound",
                     "from": {
-                        "phone_number": formatE164(fromNumber)
+                        "phone_number": formatE164(fromNumber),
+                        "status": "webhook_delivered"
                     },
-                    "to": {
-                        "phone_number": formatE164(toNumber)
-                    },
+                    "to": [
+                        {
+                            "phone_number": formatE164(toNumber),
+                            "status": "webhook_delivered"
+                        }
+                    ],
                     "text": messageText,
+                    "type": "SMS",
+                    "record_type": "message",
                     "received_at": new Date().toISOString()
-                }
+                },
+                "record_type": "event"
             }
         };
 
