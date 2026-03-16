@@ -1,0 +1,9 @@
+{
+  "name": "3cx-sangoma-sms-gcf",
+  "version": "1.0.0",
+  "description": "Google Cloud Function endpoints for Sangoma Wholesale SMS and 3CX",
+  "main": "index.js",
+  "dependencies": {
+    "axios": "^1.6.0"
+  }
+}
