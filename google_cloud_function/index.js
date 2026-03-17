@@ -1,64 +1,69 @@
 const axios = require('axios');
 
-// --- Configuration Variables ---
-// These should be configured in the Google Cloud Console under Environment Variables
-// for each respective cloud function.
+// Helper: ensure E.164 format, handles 10/11-digit US numbers and array inputs
+const formatE164 = (num) => {
+    if (Array.isArray(num)) num = num[0];
+    if (!num) return '';
+    num = String(num).trim().replace(/\D/g, ''); // strip non-digits
+    if (num.length === 10) num = '1' + num;       // assume US, prepend country code
+    return '+' + num;
+};
 
-// 1. INBOUND: Sangoma -> 3CX
-// Exported as an entry point for Google Cloud Functions
+// 1. INBOUND: Sangoma (VoIP Innovations) -> 3CX
 exports.inboundSangomaTo3cx = async (req, res) => {
     try {
         console.log('--- Received Inbound SMS from Sangoma ---');
         console.log('Payload:', JSON.stringify(req.body));
-        
+
         const sangomaBody = req.body;
-        
-        // Extract fields
-        const fromNumber = sangomaBody.from; 
-        const toNumber = sangomaBody.to;
-        const messageText = sangomaBody.body || sangomaBody.text || '';
-        const messageId = sangomaBody.id || `msg-${Date.now()}`;
 
-        // Ensure E.164 format (Add '+' if missing)
-        const formatE164 = (num) => (num && !num.startsWith('+') ? `+${num}` : num);
+        // Sangoma sends caller_id_number and destination_number (NOT from/to)
+        const fromNumber  = formatE164(sangomaBody.caller_id_number);
+        const toNumber    = formatE164(sangomaBody.destination_number);
+        const messageText = sangomaBody.text || '';
+        const messageId   = sangomaBody.id || `msg-${Date.now()}`;
 
-        // Construct 3CX Expected Payload (Generic SMS Provider format)
+        if (!fromNumber || !toNumber) {
+            console.error('ERROR: Missing caller_id_number or destination_number in Sangoma payload.');
+            return res.status(200).send('Missing fields'); // 200 to suppress Sangoma retries
+        }
+
+        // 3CX Generic SMS expects the full Telnyx-style nested envelope
         const threeCxPayload = {
-            "data": {
-                "id": messageId,
-                "event_type": "message.received",
-                "occurred_at": new Date().toISOString(),
-                "payload": {
-                    "direction": "inbound",
-                    "from": {
-                        "phone_number": formatE164(fromNumber),
-                        "status": "webhook_delivered"
+            data: {
+                id: messageId,
+                event_type: "message.received",
+                occurred_at: new Date().toISOString(),
+                record_type: "event",
+                payload: {
+                    direction: "inbound",
+                    type: "SMS",
+                    record_type: "message",
+                    received_at: new Date().toISOString(),
+                    text: messageText,
+                    from: {
+                        phone_number: fromNumber,
+                        status: "webhook_delivered"
                     },
-                    "to": [
+                    to: [
                         {
-                            "phone_number": formatE164(toNumber),
-                            "status": "webhook_delivered"
+                            phone_number: toNumber,
+                            status: "webhook_delivered"
                         }
-                    ],
-                    "text": messageText,
-                    "type": "SMS",
-                    "record_type": "message",
-                    "received_at": new Date().toISOString()
-                },
-                "record_type": "event"
+                    ]
+                }
             }
         };
 
         const threeCxWebhookUrl = process.env.THREECX_WEBHOOK_URL;
-        
+
         if (!threeCxWebhookUrl) {
             console.error('ERROR: THREECX_WEBHOOK_URL environment variable is missing.');
-            return res.status(200).send('Missing 3CX Webhook config'); // Returning 200 to Sangoma to prevent repeating webhook retry attempts
+            return res.status(200).send('Missing 3CX Webhook config');
         }
 
-        console.log('Sending JSON Payload to 3CX:', JSON.stringify(threeCxPayload));
+        console.log('Sending to 3CX:', JSON.stringify(threeCxPayload));
 
-        // Send to 3CX
         const cxResponse = await axios.post(threeCxWebhookUrl, threeCxPayload, {
             headers: { 'Content-Type': 'application/json' }
         });
@@ -68,58 +73,59 @@ exports.inboundSangomaTo3cx = async (req, res) => {
 
     } catch (error) {
         console.error('Error forwarding to 3CX:', error.message);
-        // We still return 200 so Sangoma doesn't repeatedly retry a failed event mapping
-        res.status(200).send('Error processed'); 
+        res.status(200).send('Error processed'); // 200 to suppress Sangoma retries
     }
 };
 
-// 2. OUTBOUND: 3CX -> Sangoma
-// Exported as an entry point for Google Cloud Functions
+// 2. OUTBOUND: 3CX -> Sangoma (VoIP Innovations)
 exports.outbound3cxToSangoma = async (req, res) => {
     try {
         console.log('--- Received Outbound SMS from 3CX ---');
         console.log('Payload:', JSON.stringify(req.body));
 
         const cxBody = req.body;
-        
-        // Extract 3CX Outbound JSON Webhook structure
-        const fromNumber = cxBody.from;   // E.g. +19542223333
-        const toNumber = cxBody.to;       // E.g. +15551234567
-        const messageText = cxBody.text;
 
-        const sangomaApiKey = process.env.SANGOMA_API_KEY;
+        const fromNumber  = formatE164(cxBody.from);
+        const toNumber    = formatE164(cxBody.to);
+        const messageText = cxBody.text || cxBody.body || '';
+
+        if (!fromNumber || !toNumber || !messageText) {
+            console.error('ERROR: Missing from, to, or text in 3CX payload.');
+            return res.status(400).send('Missing required fields');
+        }
+
+        const sangomaApiKey    = process.env.SANGOMA_API_KEY;
         const sangomaApiSecret = process.env.SANGOMA_API_SECRET;
 
         if (!sangomaApiKey || !sangomaApiSecret) {
-            console.error('ERROR: Sangoma API credentials (SANGOMA_API_KEY / SANGOMA_API_SECRET) environment variables are missing.');
+            console.error('ERROR: Sangoma API credentials missing.');
             return res.status(500).send('Server configuration error');
         }
 
-        // Construct Sangoma API URL (Apidaze CPaaS endpoint for VoIP Innovations)
         const sangomaUrl = `https://api.apidaze.io/${sangomaApiKey}/sms/send?api_secret=${sangomaApiSecret}`;
 
-        // Construct Sangoma Payload
+        // Sangoma wants bare 11-digit numbers, no + prefix
         const sangomaPayload = {
-            to: toNumber,
-            from: fromNumber,
-            body: messageText,
+            to:          toNumber.replace('+', ''),
+            from:        fromNumber.replace('+', ''),
+            body:        messageText,
             num_retries: 3
         };
 
-        console.log('Sending JSON Payload to Sangoma API:', JSON.stringify(sangomaPayload));
-        
-        // Send to Sangoma API
+        console.log('Sending to Sangoma API:', JSON.stringify(sangomaPayload));
+
         const sangomaResponse = await axios.post(sangomaUrl, sangomaPayload, {
             headers: { 'Content-Type': 'application/json' }
         });
 
         console.log('Sangoma API Response Status:', sangomaResponse.status);
-
-        // 3CX expects a 200 OK
         res.status(200).send('OK');
 
     } catch (error) {
         console.error('Error forwarding to Sangoma:', error.message);
+        if (error.response) {
+            console.error('Sangoma error response:', JSON.stringify(error.response.data));
+        }
         res.status(500).send('Failed to send SMS');
     }
 };
